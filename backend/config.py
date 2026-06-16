@@ -25,8 +25,14 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 ANON_LIMIT = int(os.environ.get("ANON_LIMIT", "2"))          # lifetime, per device
 USER_DAILY_LIMIT = int(os.environ.get("USER_DAILY_LIMIT", "2"))  # per day, per account
 
-# Optional: residential proxy for yt-dlp (the scaling fix described in the
-# README). Leave empty for direct connections.
-YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "")
+# Proxies for yt-dlp. Either a single YTDLP_PROXY, or YTDLP_PROXIES as a
+# comma- or newline-separated list (the app rotates through them, trying each
+# until one isn't blocked by YouTube). Leave empty for direct connections.
+_single = os.environ.get("YTDLP_PROXY", "").strip()
+_many = os.environ.get("YTDLP_PROXIES", "").strip()
+PROXIES = [p.strip() for p in _many.replace("\n", ",").split(",") if p.strip()]
+if _single and _single not in PROXIES:
+    PROXIES.insert(0, _single)
+
 # Optional path to a cookies.txt for restricted/age-gated videos.
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES", "")

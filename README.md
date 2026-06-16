@@ -48,7 +48,8 @@ so the Space's ephemeral disk is only used for in-flight downloads.
 | `ADMIN_PASSWORD` | | `admin123` | **change this** |
 | `ANON_LIMIT` | | `2` | free downloads per device |
 | `USER_DAILY_LIMIT` | | `2` | per registered account/day |
-| `YTDLP_PROXY` | | — | residential proxy (see scaling) |
+| `YTDLP_PROXY` | | — | single proxy (see scaling) |
+| `YTDLP_PROXIES` | | — | comma-separated proxy list; app rotates through them |
 | `YTDLP_COOKIES` | | — | path to cookies.txt |
 
 ## Deploy to Hugging Face Spaces

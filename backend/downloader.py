@@ -2,6 +2,7 @@
 import concurrent.futures
 import glob
 import os
+import random
 import re
 import shutil
 import threading
@@ -10,7 +11,7 @@ import uuid
 
 from yt_dlp import YoutubeDL
 
-from config import YTDLP_COOKIES, YTDLP_PROXY
+from config import PROXIES, YTDLP_COOKIES
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -40,8 +41,27 @@ FFMPEG_AVAILABLE = FFMPEG_DIR is not None
 if FFMPEG_DIR:
     os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
 
-# True when a proxy is set — used to tailor the "blocked" message and a UI banner.
-PROXY_CONFIGURED = bool(YTDLP_PROXY)
+# True when at least one proxy is set — tailors the "blocked" message + UI banner.
+PROXY_CONFIGURED = bool(PROXIES)
+
+
+def _proxy_candidates():
+    """Proxies to try, in random order; [None] means a direct connection."""
+    if not PROXIES:
+        return [None]
+    pool = list(PROXIES)
+    random.shuffle(pool)
+    return pool
+
+
+def _is_blocked(err):
+    """True when the error looks like an IP/proxy block worth retrying elsewhere."""
+    low = str(err).lower()
+    return any(s in low for s in (
+        "not a bot", "sign in to confirm", "http error 429", "too many requests",
+        "video unavailable", "this content isn", "unable to download api page",
+        "ssl", "eof occurred", "timed out", "connection reset", "failed to extract",
+    ))
 
 
 def friendly_error(raw):
@@ -89,8 +109,6 @@ def _base_opts():
     }
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
-    if YTDLP_PROXY:
-        opts["proxy"] = YTDLP_PROXY
     if YTDLP_COOKIES and os.path.isfile(YTDLP_COOKIES):
         opts["cookiefile"] = YTDLP_COOKIES
     return opts
@@ -111,14 +129,16 @@ def _human_size(num):
     return f"{num:.1f} TB"
 
 
-# Bounds the synchronous /api/info call so a blocked host can't hang the
-# request past PROBE_TIMEOUT, no matter how many player clients yt-dlp tries.
+# Bounds the synchronous /api/info call. With proxies we try several, so the
+# cap is larger; without, it stays tight so a blocked host fails fast.
 PROBE_TIMEOUT = 16
-_PROBE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+PROBE_TIMEOUT_PROXIED = 35
+_PROBE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 
-def probe(url, timeout=PROBE_TIMEOUT):
+def probe(url):
     """Probe with a hard wall-clock cap; raises a friendly error on timeout."""
+    timeout = PROBE_TIMEOUT_PROXIED if PROXIES else PROBE_TIMEOUT
     future = _PROBE_POOL.submit(_probe, url)
     try:
         return future.result(timeout=timeout)
@@ -129,12 +149,23 @@ def probe(url, timeout=PROBE_TIMEOUT):
 
 
 def _probe(url):
-    """Return metadata + a de-duplicated quality list for a URL."""
-    try:
-        with YoutubeDL({**_base_opts(), "skip_download": True}) as ydl:
-            data = ydl.extract_info(url, download=False)
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(friendly_error(exc)) from exc
+    """Return metadata + qualities, rotating proxies until one isn't blocked."""
+    last = None
+    for proxy in _proxy_candidates():
+        opts = {**_base_opts(), "skip_download": True}
+        if proxy:
+            opts["proxy"] = proxy
+        try:
+            with YoutubeDL(opts) as ydl:
+                data = ydl.extract_info(url, download=False)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if proxy and _is_blocked(exc):
+                continue  # this proxy is blocked; try the next one
+            raise ValueError(friendly_error(exc)) from exc
+    else:
+        raise ValueError(friendly_error(last))
 
     if data.get("_type") == "playlist":
         entries = [e for e in data.get("entries", []) if e]
@@ -209,28 +240,50 @@ def _worker(job_id, url, fmt, mode, job_dir, on_success):
         if d.get("status") == "started":
             _set(job_id, status="processing", phase="Merging audio + video")
 
-    opts = {
-        **_base_opts(),
-        "outtmpl": os.path.join(job_dir, "%(title)s.%(ext)s"),
-        "format": fmt,
-        "progress_hooks": [progress_hook],
-        "postprocessor_hooks": [pp_hook],
-    }
-    if mode == "audio":
-        opts["format"] = "bestaudio/best"
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-            "preferredquality": "192"}]
-    elif mode == "merge" and FFMPEG_AVAILABLE:
-        opts["merge_output_format"] = "mp4"
+    def build_opts(proxy):
+        o = {
+            **_base_opts(),
+            "outtmpl": os.path.join(job_dir, "%(title)s.%(ext)s"),
+            "format": fmt,
+            "progress_hooks": [progress_hook],
+            "postprocessor_hooks": [pp_hook],
+        }
+        if proxy:
+            o["proxy"] = proxy
+        if mode == "audio":
+            o["format"] = "bestaudio/best"
+            o["postprocessors"] = [{
+                "key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+                "preferredquality": "192"}]
+        elif mode == "merge" and FFMPEG_AVAILABLE:
+            o["merge_output_format"] = "mp4"
+        return o
 
-    try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = _sanitize_filename(info.get("title", "video"))
-    except Exception as exc:  # noqa: BLE001
+    # Try proxies in turn; a blocked proxy rolls over to the next one.
+    title, last = None, None
+    for proxy in _proxy_candidates():
+        try:
+            with YoutubeDL(build_opts(proxy)) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = _sanitize_filename(info.get("title", "video"))
+            break
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            # Clear any partial fragments before retrying on another proxy.
+            for f in os.listdir(job_dir):
+                try:
+                    os.remove(os.path.join(job_dir, f))
+                except OSError:
+                    pass
+            if proxy and _is_blocked(exc):
+                _set(job_id, status="starting", phase="Switching route…")
+                continue
+            shutil.rmtree(job_dir, ignore_errors=True)
+            _set(job_id, status="error", error=friendly_error(exc))
+            return
+    else:
         shutil.rmtree(job_dir, ignore_errors=True)
-        _set(job_id, status="error", error=friendly_error(exc))
+        _set(job_id, status="error", error=friendly_error(last))
         return
 
     files = [f for f in os.listdir(job_dir)
