@@ -1,4 +1,5 @@
 """yt-dlp wrapper: format probing + background download jobs with progress."""
+import concurrent.futures
 import glob
 import os
 import re
@@ -80,8 +81,8 @@ def _base_opts():
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        # Fail fast instead of hanging ~80s when the host IP is blocked.
-        "socket_timeout": 15,
+        # Fail fast instead of hanging when the host IP is blocked.
+        "socket_timeout": 10,
         "retries": 1,
         "extractor_retries": 1,
         "fragment_retries": 1,
@@ -110,7 +111,24 @@ def _human_size(num):
     return f"{num:.1f} TB"
 
 
-def probe(url):
+# Bounds the synchronous /api/info call so a blocked host can't hang the
+# request past PROBE_TIMEOUT, no matter how many player clients yt-dlp tries.
+PROBE_TIMEOUT = 16
+_PROBE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def probe(url, timeout=PROBE_TIMEOUT):
+    """Probe with a hard wall-clock cap; raises a friendly error on timeout."""
+    future = _PROBE_POOL.submit(_probe, url)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError as exc:
+        # The yt-dlp thread keeps running in the background and will exit on
+        # its own once its socket timeouts fire; we just stop waiting.
+        raise ValueError(friendly_error("read timed out")) from exc
+
+
+def _probe(url):
     """Return metadata + a de-duplicated quality list for a URL."""
     try:
         with YoutubeDL({**_base_opts(), "skip_download": True}) as ydl:
