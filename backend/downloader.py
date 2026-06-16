@@ -148,25 +148,40 @@ def probe(url):
         raise ValueError(friendly_error("read timed out")) from exc
 
 
-def _probe(url):
-    """Return metadata + qualities, rotating proxies until one isn't blocked."""
-    last = None
-    for proxy in _proxy_candidates():
-        opts = {**_base_opts(), "skip_download": True}
-        if proxy:
-            opts["proxy"] = proxy
-        try:
-            with YoutubeDL(opts) as ydl:
-                data = ydl.extract_info(url, download=False)
-            break
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            if proxy and _is_blocked(exc):
-                continue  # this proxy is blocked; try the next one
-            raise ValueError(friendly_error(exc)) from exc
-    else:
-        raise ValueError(friendly_error(last))
+def _probe_once(url, proxy):
+    opts = {**_base_opts(), "skip_download": True}
+    if proxy:
+        opts["proxy"] = proxy
+    with YoutubeDL(opts) as ydl:
+        return _parse_info(ydl.extract_info(url, download=False))
 
+
+def _probe(url):
+    """Return metadata + qualities. With proxies, race them and take the first
+    that succeeds; without, do a single direct probe."""
+    candidates = _proxy_candidates()
+    if candidates == [None]:
+        try:
+            return _probe_once(url, None)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(friendly_error(exc)) from exc
+
+    last = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+        futures = [ex.submit(_probe_once, url, p) for p in candidates]
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                result = fut.result()
+                for f in futures:
+                    f.cancel()
+                return result
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+    raise ValueError(friendly_error(last))
+
+
+def _parse_info(data):
+    """Turn a yt-dlp info dict into our metadata + quality list."""
     if data.get("_type") == "playlist":
         entries = [e for e in data.get("entries", []) if e]
         if not entries:
@@ -275,7 +290,9 @@ def _worker(job_id, url, fmt, mode, job_dir, on_success):
                     os.remove(os.path.join(job_dir, f))
                 except OSError:
                     pass
-            if proxy and _is_blocked(exc):
+            # With a proxy, any failure rolls over to the next one; only a
+            # direct (proxy-less) attempt gives up immediately.
+            if proxy:
                 _set(job_id, status="starting", phase="Switching route…")
                 continue
             shutil.rmtree(job_dir, ignore_errors=True)

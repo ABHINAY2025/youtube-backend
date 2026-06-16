@@ -28,11 +28,21 @@ USER_DAILY_LIMIT = int(os.environ.get("USER_DAILY_LIMIT", "2"))  # per day, per 
 # Proxies for yt-dlp. Either a single YTDLP_PROXY, or YTDLP_PROXIES as a
 # comma- or newline-separated list (the app rotates through them, trying each
 # until one isn't blocked by YouTube). Leave empty for direct connections.
+def _norm_proxy(p):
+    """Normalise a proxy entry; default to http:// when no scheme is given."""
+    p = p.strip().strip('"').strip("'")
+    if p and "://" not in p:
+        p = "http://" + p
+    return p
+
+
 _single = os.environ.get("YTDLP_PROXY", "").strip()
 _many = os.environ.get("YTDLP_PROXIES", "").strip()
-PROXIES = [p.strip() for p in _many.replace("\n", ",").split(",") if p.strip()]
-if _single and _single not in PROXIES:
-    PROXIES.insert(0, _single)
+PROXIES = [_norm_proxy(p) for p in _many.replace("\n", ",").split(",") if p.strip()]
+if _single:
+    s = _norm_proxy(_single)
+    if s not in PROXIES:
+        PROXIES.insert(0, s)
 
 # Optional path to a cookies.txt for restricted/age-gated videos.
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES", "")
