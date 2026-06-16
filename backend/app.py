@@ -88,6 +88,15 @@ def me():
 
 
 # ----- video info & download --------------------------------------------
+@app.get("/api/status")
+def status():
+    """Lightweight health/config probe for the UI banner."""
+    return jsonify({
+        "ffmpeg": dl.FFMPEG_AVAILABLE,
+        "proxy_configured": dl.PROXY_CONFIGURED,
+    })
+
+
 @app.post("/api/info")
 def info():
     url = ((request.json or {}).get("url") or "").strip()
@@ -95,8 +104,8 @@ def info():
         return jsonify({"error": "Please provide a URL."}), 400
     try:
         return jsonify(dl.probe(url))
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": f"Could not read this link: {exc}"}), 400
+    except Exception as exc:  # noqa: BLE001 - probe() already returns a friendly message
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.post("/api/download")

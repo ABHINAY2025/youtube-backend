@@ -12,7 +12,7 @@ ytdl_usage:
 from datetime import datetime, timezone
 
 from pymongo import MongoClient
-from werkzeug.security import generate_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from config import (
     ADMIN_PASSWORD,
@@ -55,15 +55,30 @@ def _ensure_indexes():
 
 
 def seed_admin():
-    """Create the admin account once, if it does not already exist."""
+    """Ensure the admin account exists and matches the ADMIN_PASSWORD secret.
+
+    The secret is the single source of truth: to rotate the admin password,
+    change the ADMIN_PASSWORD secret and restart the Space. On boot we only
+    rewrite the hash when the stored one no longer matches the secret, so a
+    normal restart is a cheap no-op.
+    """
     users = _db[COLL_USERS]
-    if users.find_one({"username": ADMIN_USERNAME}) is None:
+    admin = users.find_one({"username": ADMIN_USERNAME})
+    if admin is None:
         users.insert_one({
             "username": ADMIN_USERNAME,
             "password_hash": generate_password_hash(ADMIN_PASSWORD),
             "role": "admin",
             "created_at": datetime.now(timezone.utc),
         })
+    elif not check_password_hash(admin["password_hash"], ADMIN_PASSWORD):
+        users.update_one(
+            {"_id": admin["_id"]},
+            {"$set": {
+                "password_hash": generate_password_hash(ADMIN_PASSWORD),
+                "role": "admin",
+            }},
+        )
 
 
 def _today():

@@ -45,6 +45,8 @@ async function handle(res) {
 export const api = {
   me: () => fetch(`${BASE}/me`, { headers: headers(false) }).then(handle),
 
+  status: () => fetch(`${BASE}/status`, { headers: headers(false) }).then(handle),
+
   register: (username, password) =>
     fetch(`${BASE}/auth/register`, {
       method: "POST",

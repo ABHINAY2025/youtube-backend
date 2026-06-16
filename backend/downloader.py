@@ -39,6 +39,36 @@ FFMPEG_AVAILABLE = FFMPEG_DIR is not None
 if FFMPEG_DIR:
     os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
 
+# True when a proxy is set — used to tailor the "blocked" message and a UI banner.
+PROXY_CONFIGURED = bool(YTDLP_PROXY)
+
+
+def friendly_error(raw):
+    """Turn a raw yt-dlp error into a clear, user-facing message."""
+    msg = str(raw)
+    low = msg.lower()
+    blocked = any(s in low for s in (
+        "sign in to confirm", "not a bot", "http error 429", "too many requests",
+        "unable to download api page", "ssl", "eof occurred", "read timed out",
+        "failed to extract any player response", "connection reset", "timed out",
+    ))
+    if blocked:
+        if PROXY_CONFIGURED:
+            return ("YouTube is rate-limiting the server right now. Please try "
+                    "again in a moment.")
+        return ("Downloads are temporarily unavailable: YouTube is blocking this "
+                "server's IP. The site owner needs to configure a proxy "
+                "(YTDLP_PROXY) to enable downloads.")
+    if "private video" in low:
+        return "This is a private video and can't be downloaded."
+    if "video unavailable" in low or "removed" in low:
+        return "This video is unavailable or has been removed."
+    if "age" in low and "confirm" in low:
+        return "This video is age-restricted and needs sign-in cookies to download."
+    # Fall back to a trimmed version of the raw error.
+    short = msg.split("; please report")[0].strip()
+    return f"Could not process this link: {short[:200]}"
+
 # In-memory job table. NOTE: this requires the server to run as a single
 # worker (gunicorn -w 1 --threads N). See README for the scaling path.
 JOBS = {}
@@ -46,7 +76,16 @@ JOBS_LOCK = threading.Lock()
 
 
 def _base_opts():
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        # Fail fast instead of hanging ~80s when the host IP is blocked.
+        "socket_timeout": 15,
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
+    }
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
     if YTDLP_PROXY:
@@ -73,8 +112,11 @@ def _human_size(num):
 
 def probe(url):
     """Return metadata + a de-duplicated quality list for a URL."""
-    with YoutubeDL({**_base_opts(), "skip_download": True}) as ydl:
-        data = ydl.extract_info(url, download=False)
+    try:
+        with YoutubeDL({**_base_opts(), "skip_download": True}) as ydl:
+            data = ydl.extract_info(url, download=False)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(friendly_error(exc)) from exc
 
     if data.get("_type") == "playlist":
         entries = [e for e in data.get("entries", []) if e]
@@ -170,7 +212,7 @@ def _worker(job_id, url, fmt, mode, job_dir, on_success):
             title = _sanitize_filename(info.get("title", "video"))
     except Exception as exc:  # noqa: BLE001
         shutil.rmtree(job_dir, ignore_errors=True)
-        _set(job_id, status="error", error=f"Download failed: {exc}")
+        _set(job_id, status="error", error=friendly_error(exc))
         return
 
     files = [f for f in os.listdir(job_dir)

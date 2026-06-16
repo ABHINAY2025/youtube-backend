@@ -123,6 +123,25 @@ button:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 rgba(74, 6
 button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: var(--shadow); }
 .link-btn:hover, .link-btn:active { transform: none; box-shadow: none; }
 
+/* server notice banner */
+.notice {
+  background: #fff6e6;
+  border: 2px solid var(--yellow);
+  border-radius: 14px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: #8a6d1a;
+  box-shadow: 3px 3px 0 rgba(74, 67, 100, 0.08);
+}
+.notice code {
+  background: #fbe9bf;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 0.78rem;
+}
+
 /* status banner */
 .status {
   text-align: center; padding: 14px; border-radius: 14px; background: #fff;

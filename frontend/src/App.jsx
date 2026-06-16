@@ -23,10 +23,12 @@ export default function App() {
   const [job, setJob] = useState(null); // {status, progress, phase, speed, eta}
   const [authOpen, setAuthOpen] = useState(false);
   const [authReason, setAuthReason] = useState("");
+  const [srv, setSrv] = useState(null); // { proxy_configured, ffmpeg }
 
   const refreshMe = () => api.me().then(setMe).catch(() => {});
   useEffect(() => {
     refreshMe();
+    api.status().then(setSrv).catch(() => {});
   }, []);
 
   function logout() {
@@ -130,6 +132,13 @@ export default function App() {
             </button>
           )}
         </div>
+
+        {srv && srv.proxy_configured === false && (
+          <div className="notice">
+            ⚠️ Heads up: this server has no proxy configured, so YouTube may block
+            downloads. (Admin: set <code>YTDLP_PROXY</code> to fix.)
+          </div>
+        )}
 
         <header>
           <div className="brand">
