@@ -1,0 +1,11 @@
+**/node_modules
+**/__pycache__
+**/*.pyc
+backend/venv
+backend/downloads
+backend/static_frontend
+frontend/dist
+.git
+.env
+**/.env
+*.md

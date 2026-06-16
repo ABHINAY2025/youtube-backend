@@ -1,0 +1,228 @@
+"""yt-dlp wrapper: format probing + background download jobs with progress."""
+import glob
+import os
+import re
+import shutil
+import threading
+import time
+import uuid
+
+from yt_dlp import YoutubeDL
+
+from config import YTDLP_COOKIES, YTDLP_PROXY
+
+DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def _find_ffmpeg():
+    env = os.environ.get("FFMPEG_LOCATION")
+    if env and os.path.isdir(env):
+        return env
+    if env and os.path.isfile(env):
+        return os.path.dirname(env)
+    found = shutil.which("ffmpeg")
+    if found:
+        return os.path.dirname(found)
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        hits = glob.glob(os.path.join(
+            local, "Microsoft", "WinGet", "Packages",
+            "Gyan.FFmpeg*", "**", "bin", "ffmpeg.exe"), recursive=True)
+        if hits:
+            return os.path.dirname(hits[0])
+    return None
+
+
+FFMPEG_DIR = _find_ffmpeg()
+FFMPEG_AVAILABLE = FFMPEG_DIR is not None
+if FFMPEG_DIR:
+    os.environ["PATH"] = FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
+
+# In-memory job table. NOTE: this requires the server to run as a single
+# worker (gunicorn -w 1 --threads N). See README for the scaling path.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def _base_opts():
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    if FFMPEG_DIR:
+        opts["ffmpeg_location"] = FFMPEG_DIR
+    if YTDLP_PROXY:
+        opts["proxy"] = YTDLP_PROXY
+    if YTDLP_COOKIES and os.path.isfile(YTDLP_COOKIES):
+        opts["cookiefile"] = YTDLP_COOKIES
+    return opts
+
+
+def _sanitize_filename(name):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name or "")
+    return name.strip().rstrip(".")[:150] or "video"
+
+
+def _human_size(num):
+    if not num:
+        return None
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024:
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} TB"
+
+
+def probe(url):
+    """Return metadata + a de-duplicated quality list for a URL."""
+    with YoutubeDL({**_base_opts(), "skip_download": True}) as ydl:
+        data = ydl.extract_info(url, download=False)
+
+    if data.get("_type") == "playlist":
+        entries = [e for e in data.get("entries", []) if e]
+        if not entries:
+            raise ValueError("Empty playlist.")
+        data = entries[0]
+
+    video_q, progressive = {}, {}
+    for f in data.get("formats", []):
+        h, vcodec, acodec = f.get("height"), f.get("vcodec"), f.get("acodec")
+        if not h or vcodec in (None, "none"):
+            continue
+        has_audio = acodec not in (None, "none")
+        entry = {
+            "format_id": f.get("format_id"), "height": h, "ext": f.get("ext"),
+            "filesize": f.get("filesize") or f.get("filesize_approx"),
+            "tbr": f.get("tbr"),
+        }
+        if has_audio:
+            cur = progressive.get(h)
+            if not cur or (entry["ext"] == "mp4" and cur["ext"] != "mp4"):
+                progressive[h] = entry
+        cur = video_q.get(h)
+        if not cur or (f.get("tbr") or 0) > (cur.get("tbr") or 0):
+            video_q[h] = entry
+
+    qualities = []
+    for h in sorted(video_q, reverse=True):
+        if FFMPEG_AVAILABLE:
+            qualities.append({
+                "label": f"{h}p", "height": h, "mode": "merge",
+                "format_id": f"bestvideo[height<={h}]+bestaudio/best[height<={h}]",
+                "filesize": _human_size(video_q[h].get("filesize")),
+            })
+        elif h in progressive:
+            qualities.append({
+                "label": f"{h}p", "height": h, "mode": "progressive",
+                "format_id": progressive[h]["format_id"],
+                "filesize": _human_size(progressive[h].get("filesize")),
+            })
+
+    return {
+        "title": data.get("title"),
+        "uploader": data.get("uploader"),
+        "duration": data.get("duration"),
+        "thumbnail": data.get("thumbnail"),
+        "qualities": qualities,
+        "ffmpeg": FFMPEG_AVAILABLE,
+    }
+
+
+def _set(job_id, **fields):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(fields)
+
+
+def _worker(job_id, url, fmt, mode, job_dir, on_success):
+    def progress_hook(d):
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = d.get("downloaded_bytes") or 0
+            pct = (done / total * 100) if total else None
+            _set(job_id, status="downloading",
+                 progress=round(pct, 1) if pct is not None else None,
+                 speed=_human_size(d.get("speed")), eta=d.get("eta"),
+                 phase="Downloading")
+        elif d.get("status") == "finished":
+            _set(job_id, status="processing", progress=100, phase="Processing")
+
+    def pp_hook(d):
+        if d.get("status") == "started":
+            _set(job_id, status="processing", phase="Merging audio + video")
+
+    opts = {
+        **_base_opts(),
+        "outtmpl": os.path.join(job_dir, "%(title)s.%(ext)s"),
+        "format": fmt,
+        "progress_hooks": [progress_hook],
+        "postprocessor_hooks": [pp_hook],
+    }
+    if mode == "audio":
+        opts["format"] = "bestaudio/best"
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+            "preferredquality": "192"}]
+    elif mode == "merge" and FFMPEG_AVAILABLE:
+        opts["merge_output_format"] = "mp4"
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = _sanitize_filename(info.get("title", "video"))
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(job_dir, ignore_errors=True)
+        _set(job_id, status="error", error=f"Download failed: {exc}")
+        return
+
+    files = [f for f in os.listdir(job_dir)
+             if os.path.isfile(os.path.join(job_dir, f))]
+    if not files:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        _set(job_id, status="error", error="No file produced.")
+        return
+
+    filepath = os.path.join(job_dir, files[0])
+    ext = os.path.splitext(files[0])[1]
+    _set(job_id, status="ready", progress=100, phase="Ready",
+         filepath=filepath, download_name=f"{title}{ext}", job_dir=job_dir)
+    if on_success:
+        try:
+            on_success()  # record quota usage only when the file is ready
+        except Exception:  # noqa: BLE001 - never fail the download on bookkeeping
+            pass
+
+
+def start_job(url, fmt, mode, on_success=None):
+    job_id = uuid.uuid4().hex
+    job_dir = os.path.join(DOWNLOAD_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "starting", "progress": 0, "phase": "Starting",
+                        "speed": None, "eta": None, "error": None}
+    threading.Thread(target=_worker,
+                     args=(job_id, url, fmt, mode, job_dir, on_success),
+                     daemon=True).start()
+    return job_id
+
+
+def get_job(job_id):
+    with JOBS_LOCK:
+        return JOBS.get(job_id)
+
+
+def public_job(job_id):
+    job = get_job(job_id)
+    if not job:
+        return None
+    return {k: v for k, v in job.items() if k not in ("filepath", "job_dir")}
+
+
+def schedule_cleanup(job_id, delay=120):
+    def _rm():
+        time.sleep(delay)
+        job = get_job(job_id)
+        if job and job.get("job_dir"):
+            shutil.rmtree(job["job_dir"], ignore_errors=True)
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+
+    threading.Thread(target=_rm, daemon=True).start()
